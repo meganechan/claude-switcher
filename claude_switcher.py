@@ -16,7 +16,7 @@ BACKUP_DIR = os.path.expanduser("~/.claude-switcher")
 BACKUP_FILE = os.path.join(BACKUP_DIR, "accounts.json")
 CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 USAGE_API = "https://api.anthropic.com/api/oauth/usage"
-REFRESH_INTERVAL = 300  # 5 minutes
+REFRESH_INTERVAL = 300
 
 
 def read_keychain_token():
@@ -92,9 +92,39 @@ def fetch_usage(access_token):
         )
         if resp.status_code == 200:
             return resp.json()
+        if resp.status_code == 401:
+            return "expired"
     except Exception:
         pass
     return None
+
+
+def delegated_refresh():
+    """Let Claude CLI refresh the token via `claude auth status`."""
+    try:
+        result = subprocess.run(
+            ["claude", "auth", "status"],
+            capture_output=True, text=True, timeout=15
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def validate_token(access_token):
+    """Check if token is still valid by calling usage API."""
+    try:
+        resp = requests.get(
+            USAGE_API,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "anthropic-beta": "oauth-2025-04-20",
+            },
+            timeout=10,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
 
 
 def load_accounts():
@@ -113,13 +143,36 @@ def save_accounts(accounts):
 
 class ClaudeSwitcherApp(rumps.App):
     def __init__(self):
-        super().__init__("CC", quit_button=None)
         self.accounts = load_accounts()
         self.current_email = None
         self.usage_data = None
-        self.menu = []
+
         self._detect_current()
-        self._build_menu()
+
+        self.active_item = rumps.MenuItem(f"Active: {self.current_email or 'none'}")
+        self.active_item.set_callback(None)
+        self.session_item = rumps.MenuItem("Session (5h): ...")
+        self.session_item.set_callback(None)
+        self.weekly_item = rumps.MenuItem("Weekly: ...")
+        self.weekly_item.set_callback(None)
+        self.reset_item = rumps.MenuItem("Reset: ...")
+        self.reset_item.set_callback(None)
+
+        super().__init__("CC", menu=[
+            self.active_item,
+            None,
+            self.session_item,
+            self.weekly_item,
+            self.reset_item,
+            None,
+            rumps.MenuItem("Switch Account"),
+            None,
+            rumps.MenuItem("Add Current Account"),
+            rumps.MenuItem("Refresh Usage"),
+            None,
+            rumps.MenuItem("Quit"),
+        ], quit_button=None)
+
         self._start_refresh()
 
     def _detect_current(self):
@@ -133,54 +186,24 @@ class ClaudeSwitcherApp(rumps.App):
             }
             save_accounts(self.accounts)
 
-    def _build_menu(self):
-        self.menu.clear()
-
-        header = rumps.MenuItem(f"Active: {self.current_email or 'none'}")
-        header.set_callback(None)
-        self.menu.add(header)
-        self.menu.add(rumps.separator)
-
-        if self.usage_data:
-            five_h = self.usage_data.get("fiveHour", {})
-            seven_d = self.usage_data.get("sevenDay", {})
+    def _update_display(self):
+        self.active_item.title = f"Active: {self.current_email or 'none'}"
+        if self.usage_data and self.usage_data != "expired":
+            five_h = self.usage_data.get("five_hour", {}) or {}
+            seven_d = self.usage_data.get("seven_day", {}) or {}
             s_pct = five_h.get("utilization", "?")
             w_pct = seven_d.get("utilization", "?")
-            s_item = rumps.MenuItem(f"Session (5h): {s_pct}%")
-            s_item.set_callback(None)
-            w_item = rumps.MenuItem(f"Weekly: {w_pct}%")
-            w_item.set_callback(None)
-            self.menu.add(s_item)
-            self.menu.add(w_item)
-
-            w_reset = seven_d.get("resetAt")
-            if w_reset:
-                r_item = rumps.MenuItem(f"Reset: {w_reset[:16]}")
-                r_item.set_callback(None)
-                self.menu.add(r_item)
-
-            self.menu.add(rumps.separator)
+            self.session_item.title = f"Session (5h): {s_pct}%"
+            self.weekly_item.title = f"Weekly: {w_pct}%"
+            w_reset = seven_d.get("resets_at", "")
+            self.reset_item.title = f"Reset: {w_reset[:16]}" if w_reset else "Reset: ..."
             self.title = f"CC {w_pct}%"
+        elif self.usage_data == "expired":
+            self.title = "CC expired"
+            self.session_item.title = "Session (5h): expired"
+            self.weekly_item.title = "Weekly: expired"
         else:
             self.title = "CC"
-
-        self.menu.add(rumps.MenuItem("Switch Account", key="s"))
-        self.menu.add(rumps.separator)
-
-        if len(self.accounts) > 0:
-            accounts_menu = rumps.MenuItem("Accounts")
-            for email in self.accounts:
-                marker = " ✓" if email == self.current_email else ""
-                item = rumps.MenuItem(f"{email}{marker}")
-                item.email = email
-                accounts_menu.add(item)
-            self.menu.add(accounts_menu)
-
-        self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Add Current Account"))
-        self.menu.add(rumps.MenuItem("Refresh Usage"))
-        self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Quit"))
 
     def _start_refresh(self):
         def loop():
@@ -197,8 +220,19 @@ class ClaudeSwitcherApp(rumps.App):
         access_token = extract_access_token(token_str)
         if not access_token:
             return
-        self.usage_data = fetch_usage(access_token)
-        rumps.Timer(0, lambda _: self._build_menu()).start()
+        result = fetch_usage(access_token)
+        if result == "expired":
+            if delegated_refresh():
+                token_str = read_keychain_token()
+                if token_str:
+                    access_token = extract_access_token(token_str)
+                    if access_token:
+                        result = fetch_usage(access_token)
+                        # Update saved token after refresh
+                        if result and result != "expired":
+                            self._detect_current()
+        self.usage_data = result
+        self._update_display()
 
     @rumps.clicked("Switch Account")
     def switch_account(self, _):
@@ -230,10 +264,12 @@ class ClaudeSwitcherApp(rumps.App):
                 pass
 
     def _do_switch(self, target_email):
+        # Save current account's live token before switching
+        prev_email = self.current_email
         current_token = read_keychain_token()
         current_oauth = read_oauth_account()
-        if current_token and self.current_email and self.current_email != "unknown":
-            self.accounts[self.current_email] = {
+        if current_token and prev_email and prev_email != "unknown":
+            self.accounts[prev_email] = {
                 "token": current_token,
                 "oauth": current_oauth,
             }
@@ -243,27 +279,67 @@ class ClaudeSwitcherApp(rumps.App):
             rumps.alert("Error", f"No backup for {target_email}")
             return
 
+        # Write target credentials
         ok_token = write_keychain_token(target["token"])
         ok_oauth = write_oauth_account(target["oauth"])
 
-        if ok_token and ok_oauth:
-            self.current_email = target_email
+        if not (ok_token and ok_oauth):
+            rumps.alert("Error", "Failed to write credentials")
+            return
+
+        self.current_email = target_email
+
+        # Check if token is already valid
+        access = extract_access_token(target["token"])
+        if access and validate_token(access):
             save_accounts(self.accounts)
             self._refresh_usage()
-            self._build_menu()
+            self._update_display()
             rumps.notification(
                 "Claude Switcher",
                 f"Switched to {target_email}",
-                "Restart Claude Code for changes to take effect.",
+                "Ready to use.",
             )
-        else:
-            rumps.alert("Error", "Failed to write credentials")
+            return
+
+        # Token expired — try delegated refresh via CLI
+        if delegated_refresh():
+            new_token = read_keychain_token()
+            new_access = extract_access_token(new_token) if new_token else None
+            if new_access and validate_token(new_access):
+                self.accounts[target_email]["token"] = new_token
+                save_accounts(self.accounts)
+                self._refresh_usage()
+                self._update_display()
+                rumps.notification(
+                    "Claude Switcher",
+                    f"Switched to {target_email}",
+                    "Token refreshed. Ready to use.",
+                )
+                return
+
+        # Refresh failed — switch back to previous account
+        prev = self.accounts.get(prev_email)
+        if prev:
+            write_keychain_token(prev["token"])
+            write_oauth_account(prev["oauth"])
+            self.current_email = prev_email
+        save_accounts(self.accounts)
+        self._refresh_usage()
+        self._update_display()
+        rumps.alert(
+            "Token Expired",
+            f"Token for {target_email} is expired.\n"
+            f"Switched back to {prev_email}.\n\n"
+            "To fix: run 'claude login' with that account,\n"
+            "then click 'Add Current Account'.",
+        )
 
     @rumps.clicked("Add Current Account")
     def add_current(self, _):
         self._detect_current()
         save_accounts(self.accounts)
-        self._build_menu()
+        self._update_display()
         rumps.notification(
             "Claude Switcher",
             f"Saved: {self.current_email}",
@@ -277,10 +353,6 @@ class ClaudeSwitcherApp(rumps.App):
     @rumps.clicked("Quit")
     def quit_app(self, _):
         rumps.quit_application()
-
-    @rumps.clicked("Accounts")
-    def account_clicked(self, sender):
-        pass
 
 
 if __name__ == "__main__":
